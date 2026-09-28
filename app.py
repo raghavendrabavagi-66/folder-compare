@@ -361,7 +361,7 @@ def read_text_diff(left_path: str, right_path: str, relative_path: str) -> dict[
 
 
 def pick_folder() -> str | None:
-    """Open a native folder chooser. Prefer osascript on macOS to avoid Tk thread issues."""
+    """Open a native folder chooser (macOS, Windows, or Tk fallback)."""
     if sys.platform == "darwin":
         script = 'POSIX path of (choose folder with prompt "Select folder")'
         try:
@@ -378,8 +378,72 @@ def pick_folder() -> str | None:
         path = completed.stdout.strip()
         return path or None
 
-    # Fallback for other platforms: path entry only (no GUI picker).
-    return None
+    if sys.platform == "win32":
+        ps_script = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
+            "$d.Description = 'Select folder'; "
+            "$d.ShowNewFolderButton = $true; "
+            "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
+            "{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+            "Write-Output $d.SelectedPath }"
+        )
+        try:
+            completed = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    ps_script,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError:
+            return _pick_folder_tk()
+        if completed.returncode != 0:
+            return _pick_folder_tk()
+        path = (completed.stdout or "").strip()
+        return path or None
+
+    return _pick_folder_tk()
+
+
+def _pick_folder_tk() -> str | None:
+    """Folder picker via a short-lived Tk process (safe off the server thread)."""
+    script = (
+        "import tkinter as tk\n"
+        "from tkinter import filedialog\n"
+        "root = tk.Tk()\n"
+        "root.withdraw()\n"
+        "try:\n"
+        "    root.attributes('-topmost', True)\n"
+        "except Exception:\n"
+        "    pass\n"
+        "path = filedialog.askdirectory(title='Select folder')\n"
+        "root.destroy()\n"
+        "print(path or '')\n"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    path = (completed.stdout or "").strip()
+    return path or None
 
 
 def normalize_gitlab_host(host: str) -> str:
