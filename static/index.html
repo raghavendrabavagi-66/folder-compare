@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Folder Compare</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <h1>Folder Compare</h1>
+          <p id="brandSubtitle">
+            Compare two folders, spot missing paths and content changes, then
+            copy across.
+          </p>
+          <div class="mode-tabs" role="tablist" aria-label="Compare mode">
+            <button
+              type="button"
+              class="mode-tab active"
+              role="tab"
+              id="modeLocal"
+              data-mode="local"
+              aria-selected="true"
+            >
+              Local ↔ Local
+            </button>
+            <button
+              type="button"
+              class="mode-tab"
+              role="tab"
+              id="modeGit"
+              data-mode="git-local"
+              aria-selected="false"
+            >
+              GitLab ↔ Local
+            </button>
+          </div>
+        </div>
+        <div class="summary-pills" id="summaryPills" hidden></div>
+      </header>
+
+      <div class="path-row">
+        <div class="path-card" id="leftCard">
+          <div id="localLeftFields">
+            <label for="leftPath" id="leftPathLabel">Left folder</label>
+            <div class="path-actions">
+              <input id="leftPath" placeholder="/path/to/folder-a" spellcheck="false" />
+              <button type="button" class="btn" id="browseLeft">Browse</button>
+            </div>
+          </div>
+
+          <div id="gitLeftFields" hidden>
+            <label for="gitlabHost">GitLab URL</label>
+            <input
+              id="gitlabHost"
+              value="https://gitlab.com"
+              placeholder="https://gitlab.com"
+              spellcheck="false"
+            />
+
+            <label for="gitlabProjectId">Project ID</label>
+            <input
+              id="gitlabProjectId"
+              placeholder="12345 or group/subgroup/project"
+              spellcheck="false"
+            />
+
+            <label for="gitlabToken">Personal Access Token</label>
+            <div class="path-actions">
+              <input
+                id="gitlabToken"
+                type="password"
+                placeholder="glpat-…"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <button type="button" class="btn btn-primary" id="gitlabAuthBtn">
+                Authenticate
+              </button>
+            </div>
+
+            <div class="git-branch-row" id="gitBranchRow" hidden>
+              <label for="branchSelect">Branch</label>
+              <div class="branch-actions">
+                <select id="branchSelect" disabled>
+                  <option value="">Authenticate to load branches</option>
+                </select>
+                <button type="button" class="btn" id="refreshBranches" disabled>
+                  Refresh
+                </button>
+              </div>
+              <p class="git-auth-meta" id="gitAuthMeta" hidden></p>
+            </div>
+          </div>
+        </div>
+
+        <div class="compare-slot">
+          <button type="button" class="btn btn-primary" id="compareBtn">Compare</button>
+        </div>
+
+        <div class="path-card">
+          <label for="rightPath" id="rightPathLabel">Right folder</label>
+          <div class="path-actions">
+            <input id="rightPath" placeholder="/path/to/folder-b" spellcheck="false" />
+            <button type="button" class="btn" id="browseRight">Browse</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="workspace">
+        <section class="panel">
+          <div class="panel-header">
+            <h2 id="leftTitle">Left</h2>
+            <span class="panel-meta" id="leftMeta">Click to select</span>
+          </div>
+          <div class="tree-scroll" id="leftTree">
+            <div class="tree-empty">
+              Choose a folder path, then compare to see the tree.
+            </div>
+          </div>
+        </section>
+
+        <div class="transfer-rail">
+          <button
+            type="button"
+            class="transfer-btn"
+            id="toRight"
+            title="Copy selected from left to right"
+            disabled
+          >
+            →
+          </button>
+          <span class="transfer-hint">Transfer</span>
+          <button
+            type="button"
+            class="transfer-btn"
+            id="toLeft"
+            title="Copy selected from right to left"
+            disabled
+          >
+            ←
+          </button>
+          <div class="ignore-actions">
+            <button type="button" class="btn btn-small" id="ignoreBtn" disabled title="Ignore selected paths">
+              Ignore
+            </button>
+            <button type="button" class="btn btn-small" id="unignoreBtn" disabled title="Stop ignoring selected paths">
+              Unignore
+            </button>
+          </div>
+        </div>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2 id="rightTitle">Right</h2>
+            <span class="panel-meta" id="rightMeta">Click to select</span>
+          </div>
+          <div class="tree-scroll" id="rightTree">
+            <div class="tree-empty">
+              Choose a folder path, then compare to see the tree.
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="ignore-bar" id="ignoreBar" hidden>
+        <span class="ignore-bar-label">Ignored</span>
+        <div class="ignore-chips" id="ignoreChips"></div>
+        <button type="button" class="btn btn-small" id="clearIgnoresBtn">Clear all</button>
+      </div>
+
+      <footer class="status-bar">
+        <div class="legend">
+          <span class="legend-item"><span class="swatch missing"></span> Only on this side</span>
+          <span class="legend-item"><span class="swatch modified"></span> Content differs</span>
+          <span class="legend-item"><span class="swatch ghost"></span> Only on other side</span>
+          <span class="legend-item"><span class="swatch ignored"></span> Ignored</span>
+          <span class="legend-item"><span class="swatch same"></span> Matching</span>
+        </div>
+        <div id="statusText">Select two folders and click Compare.</div>
+      </footer>
+    </div>
+
+    <div class="diff-drawer" id="diffDrawer" hidden>
+      <header>
+        <h3 id="diffTitle"></h3>
+        <button type="button" class="btn" id="diffClose">Close</button>
+      </header>
+      <div class="diff-grid">
+        <div class="diff-side">
+          <h4 id="diffLeftLabel">Left</h4>
+          <pre id="diffLeft"></pre>
+        </div>
+        <div class="diff-side">
+          <h4 id="diffRightLabel">Right</h4>
+          <pre id="diffRight"></pre>
+        </div>
+      </div>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
