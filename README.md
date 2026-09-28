@@ -18,6 +18,8 @@ Light-themed tool to compare trees side by side, highlight differences, and copy
 
 The PAT is kept in memory for the session only (not saved to disk).
 
+Git LFS files are resolved to raw content on download (`include_lfs_blobs` plus pointer expansion), so transfers copy real files, not LFS pointer stubs.
+
 ## Features
 
 - Dual tree view with synced expand/collapse and scroll

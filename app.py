@@ -8,6 +8,7 @@ import io
 import json
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,13 @@ HOST = "127.0.0.1"
 PORT = 8787
 SKIP_NAMES = {".DS_Store", "Thumbs.db", ".git"}
 GITLAB_CACHE = Path(tempfile.gettempdir()) / "folder-compare-gitlab"
+# Bump when extract/LFS behavior changes so old pointer caches are ignored.
+GITLAB_CACHE_VERSION = "lfs2"
+LFS_POINTER_RE = re.compile(
+    rb"^version https://git-lfs\.github\.com/spec/v1\r?\n"
+    rb"oid sha256:([a-f0-9]{64})\r?\n"
+    rb"size (\d+)\r?\n?$"
+)
 
 
 def normalize_rel(path: str | Path) -> str:
@@ -469,6 +477,9 @@ def gitlab_request(
     api_path: str,
     *,
     binary: bool = False,
+    method: str = "GET",
+    body: bytes | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> Any:
     host = normalize_gitlab_host(host)
     token = (token or "").strip()
@@ -476,17 +487,24 @@ def gitlab_request(
         raise ValueError("Personal Access Token is required")
 
     url = f"{host}/api/v4{api_path}"
+    headers = {
+        "PRIVATE-TOKEN": token,
+        "User-Agent": "folder-compare",
+        "Accept": "application/json" if not binary else "*/*",
+    }
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    if extra_headers:
+        headers.update(extra_headers)
+
     request = urllib.request.Request(
         url,
-        headers={
-            "PRIVATE-TOKEN": token,
-            "User-Agent": "folder-compare",
-            "Accept": "application/json" if not binary else "*/*",
-        },
-        method="GET",
+        data=body,
+        headers=headers,
+        method=method,
     )
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with urllib.request.urlopen(request, timeout=300) as response:
             raw = response.read()
             if binary:
                 return raw
@@ -496,9 +514,9 @@ def gitlab_request(
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
-            body = exc.read().decode("utf-8", errors="replace")
-            parsed = json.loads(body) if body else {}
-            detail = parsed.get("message") or parsed.get("error") or body
+            err_body = exc.read().decode("utf-8", errors="replace")
+            parsed = json.loads(err_body) if err_body else {}
+            detail = parsed.get("message") or parsed.get("error") or err_body
         except Exception:
             detail = str(exc.reason or exc)
         if exc.code in {401, 403}:
@@ -513,6 +531,177 @@ def gitlab_request(
         raise ValueError(f"GitLab API error {exc.code}: {detail}".strip()) from exc
     except urllib.error.URLError as exc:
         raise ValueError(f"Could not reach GitLab at {host}: {exc.reason}") from exc
+
+
+def download_url(url: str, headers: dict[str, str] | None = None) -> bytes:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "folder-compare",
+            **(headers or {}),
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = str(exc.reason or exc)
+        raise ValueError(f"Download failed ({exc.code}): {detail}".strip()) from exc
+    except urllib.error.URLError as exc:
+        raise ValueError(f"Download failed: {exc.reason}") from exc
+
+
+def is_lfs_pointer(data: bytes) -> bool:
+    if not data or len(data) > 1024:
+        return False
+    return LFS_POINTER_RE.match(data) is not None
+
+
+def parse_lfs_pointer(data: bytes) -> tuple[str, int] | None:
+    match = LFS_POINTER_RE.match(data)
+    if not match:
+        return None
+    return match.group(1).decode("ascii"), int(match.group(2))
+
+
+def fetch_lfs_file_content(
+    host: str,
+    token: str,
+    project_id: str,
+    project_path: str,
+    relative_path: str,
+    ref: str,
+    pointer: bytes,
+) -> bytes:
+    """Resolve an LFS pointer to raw file bytes via GitLab APIs."""
+    encoded = encode_project_id(project_id)
+    file_enc = urllib.parse.quote(relative_path, safe="")
+    ref_enc = urllib.parse.quote(ref, safe="")
+
+    # Preferred: repository files raw endpoint with lfs=true (GitLab 16+).
+    try:
+        raw = gitlab_request(
+            host,
+            token,
+            f"/projects/{encoded}/repository/files/{file_enc}/raw?ref={ref_enc}&lfs=true",
+            binary=True,
+        )
+        if isinstance(raw, (bytes, bytearray)) and not is_lfs_pointer(bytes(raw)):
+            return bytes(raw)
+    except ValueError:
+        pass
+
+    parsed = parse_lfs_pointer(pointer)
+    if not parsed:
+        raise ValueError(f"Invalid LFS pointer for {relative_path}")
+    oid, size = parsed
+
+    # Fallback: Git LFS batch API under the project path.
+    host_n = normalize_gitlab_host(host)
+    batch_path = f"/{project_path.strip('/')}.git/info/lfs/objects/batch"
+    payload = json.dumps(
+        {
+            "operation": "download",
+            "transfers": ["basic"],
+            "ref": {"name": f"refs/heads/{ref}"},
+            "objects": [{"oid": oid, "size": size}],
+        }
+    ).encode("utf-8")
+
+    def _batch(url: str, headers: dict[str, str]) -> dict[str, Any]:
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Content-Type": "application/vnd.git-lfs+json",
+                "Accept": "application/vnd.git-lfs+json",
+                "User-Agent": "folder-compare",
+                **headers,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as response:
+            parsed_batch = json.loads(response.read().decode("utf-8"))
+        if not isinstance(parsed_batch, dict):
+            raise ValueError("Unexpected LFS batch response")
+        return parsed_batch
+
+    batch: dict[str, Any]
+    try:
+        batch = _batch(
+            f"{host_n}{batch_path}",
+            {"Authorization": f"Bearer {token}"},
+        )
+    except Exception:
+        parsed_host = urllib.parse.urlparse(host_n)
+        auth_netloc = f"oauth2:{urllib.parse.quote(token, safe='')}@{parsed_host.hostname}"
+        if parsed_host.port:
+            auth_netloc += f":{parsed_host.port}"
+        auth_base = urllib.parse.urlunparse(
+            (parsed_host.scheme, auth_netloc, "", "", "", "")
+        )
+        try:
+            batch = _batch(f"{auth_base}{batch_path}", {})
+        except Exception as alt_exc:
+            raise ValueError(
+                f"LFS batch failed for {relative_path}: {alt_exc}"
+            ) from alt_exc
+
+    objects = batch.get("objects") if isinstance(batch, dict) else None
+    if not objects:
+        raise ValueError(f"LFS batch returned no objects for {relative_path}")
+    obj = objects[0]
+    if obj.get("error"):
+        raise ValueError(
+            f"LFS object error for {relative_path}: {obj.get('error')}"
+        )
+    actions = obj.get("actions") or {}
+    download = actions.get("download") or {}
+    href = download.get("href")
+    if not href:
+        raise ValueError(f"No LFS download URL for {relative_path}")
+    headers = download.get("header") or {}
+    return download_url(href, headers)
+
+
+def materialize_lfs_pointers(
+    root: Path,
+    host: str,
+    token: str,
+    project_id: str,
+    project_path: str,
+    ref: str,
+) -> int:
+    """Replace any LFS pointer files under root with raw content. Returns count replaced."""
+    replaced = 0
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            if path.stat().st_size > 1024:
+                continue
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if not is_lfs_pointer(data):
+            continue
+        rel = path.relative_to(root).as_posix()
+        raw = fetch_lfs_file_content(
+            host, token, project_id, project_path, rel, ref, data
+        )
+        if is_lfs_pointer(raw):
+            raise ValueError(
+                f"GitLab still returned an LFS pointer for {rel}. "
+                "Check that LFS is enabled and the PAT can read LFS objects."
+            )
+        path.write_bytes(raw)
+        replaced += 1
+    return replaced
 
 
 def gitlab_authenticate(host: str, project_id: str, token: str) -> dict[str, Any]:
@@ -581,8 +770,9 @@ def extract_gitlab_branch(
         raise ValueError(f"Could not resolve commit for branch {branch}")
 
     project_key = str(project.get("id") or project_id)
+    project_path = str(project.get("path_with_namespace") or project_id)
     cache_key = hashlib.sha1(
-        f"{host}|{project_key}|{commit}".encode("utf-8")
+        f"{GITLAB_CACHE_VERSION}|{host}|{project_key}|{commit}".encode("utf-8")
     ).hexdigest()[:20]
     dest = GITLAB_CACHE / cache_key
     meta = GITLAB_CACHE / f"{cache_key}.commit"
@@ -599,7 +789,7 @@ def extract_gitlab_branch(
             host,
             token,
             f"/projects/{encoded}/repository/archive.tar.gz?sha="
-            f"{urllib.parse.quote(branch, safe='')}",
+            f"{urllib.parse.quote(branch, safe='')}&include_lfs_blobs=true",
             binary=True,
         )
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
@@ -615,12 +805,31 @@ def extract_gitlab_branch(
         else:
             staging.rename(dest)
 
+        # Ensure any remaining pointer stubs are replaced with raw LFS content.
+        materialize_lfs_pointers(
+            dest,
+            host,
+            token,
+            project_key,
+            project_path,
+            branch,
+        )
         meta.write_text(commit, encoding="utf-8")
+    else:
+        # Cached tree may predate LFS fix; resolve any leftover pointers in place.
+        materialize_lfs_pointers(
+            dest,
+            host,
+            token,
+            project_key,
+            project_path,
+            branch,
+        )
 
     return {
         "host": host,
         "projectId": project_key,
-        "projectPath": project.get("path_with_namespace") or project_id,
+        "projectPath": project_path,
         "projectName": project.get("name") or "",
         "branch": branch,
         "commit": commit,
