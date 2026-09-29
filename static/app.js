@@ -749,11 +749,13 @@ function renderTrees() {
 async function browse(side) {
   if (side === "left" && state.mode === "git-local") return;
   setBusy(true);
-  setStatus("Opening folder picker…");
+  setStatus("Opening folder picker… Look for a dialog (it may be behind other windows).");
   try {
     const data = await api("/api/select-folder", {});
     if (!data.path) {
-      setStatus("Folder selection cancelled.");
+      setStatus(
+        "Folder selection cancelled. You can also paste a full folder path into the text box."
+      );
       return;
     }
     if (side === "left") {

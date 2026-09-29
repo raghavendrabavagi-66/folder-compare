@@ -371,7 +371,14 @@ def read_text_diff(left_path: str, right_path: str, relative_path: str) -> dict[
 def pick_folder() -> str | None:
     """Open a native folder chooser (macOS, Windows, or Tk fallback)."""
     if sys.platform == "darwin":
-        script = 'POSIX path of (choose folder with prompt "Select folder")'
+        # Activate Finder so the dialog is not buried behind the browser.
+        script = (
+            'tell application "Finder"\n'
+            "activate\n"
+            'set theFolder to choose folder with prompt "Select folder"\n'
+            "return POSIX path of theFolder\n"
+            "end tell"
+        )
         try:
             completed = subprocess.run(
                 ["osascript", "-e", script],
@@ -380,46 +387,83 @@ def pick_folder() -> str | None:
                 check=False,
             )
         except OSError:
-            return None
-        if completed.returncode != 0:
-            return None
-        path = completed.stdout.strip()
-        return path or None
-
-    if sys.platform == "win32":
-        ps_script = (
-            "Add-Type -AssemblyName System.Windows.Forms; "
-            "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
-            "$d.Description = 'Select folder'; "
-            "$d.ShowNewFolderButton = $true; "
-            "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
-            "{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
-            "Write-Output $d.SelectedPath }"
-        )
-        try:
-            completed = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    ps_script,
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
-        except OSError:
             return _pick_folder_tk()
         if completed.returncode != 0:
+            # User cancel, or permission/automation issue — try Tk as backup.
+            err = (completed.stderr or "").strip().lower()
+            if "user canceled" in err or "user cancelled" in err:
+                return None
             return _pick_folder_tk()
         path = (completed.stdout or "").strip()
         return path or None
 
+    if sys.platform == "win32":
+        path = _pick_folder_windows()
+        if path is not None:
+            return path or None
+        return _pick_folder_tk()
+
     return _pick_folder_tk()
+
+
+def _pick_folder_windows() -> str | None:
+    """Native Windows folder dialog on an STA thread, owned by a topmost form."""
+    # PowerShell here-string keeps quoting simple and reliable.
+    ps_script = r"""
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles() | Out-Null
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.FormBorderStyle = 'FixedToolWindow'
+$owner.StartPosition = 'Manual'
+$owner.Location = New-Object System.Drawing.Point(-32000, -32000)
+$owner.Size = New-Object System.Drawing.Size(1, 1)
+$owner.Show()
+$owner.Activate()
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = 'Select folder'
+$dialog.ShowNewFolderButton = $true
+$result = $dialog.ShowDialog($owner)
+$path = ''
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+  $path = $dialog.SelectedPath
+}
+$owner.Close()
+$owner.Dispose()
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+Write-Output $path
+"""
+    try:
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-STA",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                ps_script,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=600,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    path = (completed.stdout or "").strip()
+    # Empty string means cancel or failed dialog; distinguish via stderr if needed.
+    if path:
+        return path
+    # If PowerShell printed errors, treat as failure so Tk can try.
+    if (completed.stderr or "").strip():
+        return None
+    return ""  # explicit cancel
 
 
 def _pick_folder_tk() -> str | None:
@@ -429,11 +473,18 @@ def _pick_folder_tk() -> str | None:
         "from tkinter import filedialog\n"
         "root = tk.Tk()\n"
         "root.withdraw()\n"
+        "root.update_idletasks()\n"
         "try:\n"
         "    root.attributes('-topmost', True)\n"
+        "    root.lift()\n"
+        "    root.focus_force()\n"
         "except Exception:\n"
         "    pass\n"
-        "path = filedialog.askdirectory(title='Select folder')\n"
+        "path = filedialog.askdirectory(parent=root, title='Select folder', mustexist=True)\n"
+        "try:\n"
+        "    root.attributes('-topmost', False)\n"
+        "except Exception:\n"
+        "    pass\n"
         "root.destroy()\n"
         "print(path or '')\n"
     )
@@ -445,8 +496,9 @@ def _pick_folder_tk() -> str | None:
             encoding="utf-8",
             errors="replace",
             check=False,
+            timeout=600,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if completed.returncode != 0:
         return None
